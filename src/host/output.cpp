@@ -35,6 +35,8 @@ using namespace Microsoft::Console::Interactivity;
     // codepage by console.cpl or shell32. The default codepage is OEMCP.
     gci.CP = gci.GetCodePage();
     gci.OutputCP = gci.GetCodePage();
+    gci.DefaultCP = gci.GetCodePage();
+    gci.DefaultOutputCP = gci.GetCodePage();
 
     gci.Flags |= CONSOLE_USE_PRIVATE_FLAGS;
 
@@ -113,6 +115,9 @@ static void _CopyRectangle(SCREEN_INFORMATION& screenInfo,
             next = OutputCell(*screenInfo.GetCellDataAt(sourcePos));
             screenInfo.GetTextBuffer().WriteLine(OutputCellIterator({ &current, 1 }), targetPos);
         } while (target.WalkInBounds(targetPos, walkDirection));
+
+        auto& textBuffer = screenInfo.GetTextBuffer();
+        ImageSlice::CopyBlock(textBuffer, source.ToExclusive(), textBuffer, target.ToExclusive());
     }
 }
 
@@ -222,7 +227,12 @@ std::wstring ReadOutputStringW(const SCREEN_INFORMATION& screenInfo,
             // Otherwise, add anything that isn't a trailing cell. (Trailings are duplicate copies of the leading.)
             if (it->DbcsAttr() != DbcsAttribute::Trailing)
             {
-                retVal += it->Chars();
+                auto chars = it->Chars();
+                if (chars.size() > 1)
+                {
+                    chars = { &UNICODE_REPLACEMENT, 1 };
+                }
+                retVal += chars;
             }
         }
 
@@ -291,38 +301,6 @@ static void _ScrollScreen(SCREEN_INFORMATION& screenInfo, const Viewport& source
     textBuffer.TriggerRedraw(target);
     // Also redraw anything that was filled.
     textBuffer.TriggerRedraw(fill);
-}
-
-// Routine Description:
-// - This routine is a special-purpose scroll for use by AdjustCursorPosition.
-// Arguments:
-// - screenInfo - reference to screen buffer info.
-// Return Value:
-// - true if we succeeded in scrolling the buffer, otherwise false (if we're out of memory)
-void StreamScrollRegion(SCREEN_INFORMATION& screenInfo)
-{
-    // Rotate the circular buffer around and wipe out the previous final line.
-    auto& buffer = screenInfo.GetTextBuffer();
-    buffer.IncrementCircularBuffer(buffer.GetCurrentAttributes());
-
-    // Trigger a graphical update if we're active.
-    if (screenInfo.IsActiveScreenBuffer())
-    {
-        til::point coordDelta;
-        coordDelta.y = -1;
-
-        auto pNotifier = ServiceLocator::LocateAccessibilityNotifier();
-        if (pNotifier)
-        {
-            // Notify accessibility that a scroll has occurred.
-            pNotifier->NotifyConsoleUpdateScrollEvent(coordDelta.x, coordDelta.y);
-        }
-
-        if (ServiceLocator::LocateGlobals().pRender != nullptr)
-        {
-            ServiceLocator::LocateGlobals().pRender->TriggerScroll(&coordDelta);
-        }
-    }
 }
 
 // Routine Description:
@@ -453,6 +431,9 @@ void ScrollRegion(SCREEN_INFORMATION& screenInfo,
         const auto& view = remaining.at(i);
         screenInfo.WriteRect(fillData, view);
 
+        // If the region has image content it needs to be erased.
+        ImageSlice::EraseBlock(screenInfo.GetTextBuffer(), view.ToExclusive());
+
         // If we're scrolling an area that encompasses the full buffer width,
         // then the filled rows should also have their line rendition reset.
         if (view.Width() == buffer.Width() && destinationOriginGiven.x == 0)
@@ -490,8 +471,6 @@ void SetActiveScreenBuffer(SCREEN_INFORMATION& screenInfo)
 
     // Set window size.
     screenInfo.PostUpdateWindowSize();
-
-    gci.ConsoleIme.RefreshAreaAttributes();
 
     // Write data to screen.
     WriteToScreen(screenInfo, screenInfo.GetViewport());
